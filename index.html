@@ -32,6 +32,7 @@ h1 small{font-family:var(--sans);font-size:12px;color:var(--muted);font-weight:4
 .toggle{flex:0 0 auto;border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px 10px;font-size:13px;cursor:pointer}
 .toggle.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .blocked{margin:10px 14px 0;padding:10px 12px;border-radius:10px;background:#fff3cd;border:1px solid #e6cf85;font-size:13px;line-height:1.45}
+.cstat{font-size:11px;color:var(--muted);padding:2px 14px 0}
 .count{font-size:12px;color:var(--muted);padding:8px 14px 0}
 main{padding:8px 10px 110px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
@@ -126,6 +127,7 @@ main{padding:8px 10px 110px}
 .toast{position:fixed;left:50%;bottom:86px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 14px;border-radius:8px;font-size:13px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.on{opacity:1}
 @media (min-width:700px){ .grid{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:16px} main{padding:12px 20px 110px} header{padding:12px 20px 10px} .blocked{margin:10px 14px 0;padding:10px 12px;border-radius:10px;background:#fff3cd;border:1px solid #e6cf85;font-size:13px;line-height:1.45}
+.cstat{font-size:11px;color:var(--muted);padding:2px 14px 0}
 .count{padding:8px 20px 0}}
 </style>
 </head>
@@ -148,7 +150,7 @@ main{padding:8px 10px 110px}
   </div>
 </header>
 <div class="blocked" id="blocked" hidden><b>As capas não estão carregando.</b> Este visualizador está bloqueando o acesso à internet. Abra o arquivo direto no Chrome, Safari ou Edge (no computador ou no celular) e as capas aparecem.</div>
-<div class="count" id="count"></div>
+<div class="count" id="count"></div><div class="cstat" id="cstat"></div>
 <main><div class="grid" id="grid"></div><div class="empty" id="empty" hidden>Nenhum livro encontrado com esses filtros.</div><div class="sentinel" id="sent"></div></main>
 
 <div class="bar" id="bar"><div class="meter" id="meter"></div><div class="sum"><b id="barTotal">R$ 0,00</b><span id="barSub">nenhum livro na lista</span></div><button class="go">Minha lista</button></div>
@@ -193,46 +195,58 @@ function fakeCover(b,small){
   if(small) return '<div class="fake" style="background:'+hue(EDS[b[2]])+';padding:4px"></div>';
   return '<div class="fake" style="background:'+hue(EDS[b[2]])+'"><div><div class="t">'+esc(b[0])+'</div><div class="a" style="margin-top:6px">'+esc(b[1])+'</div></div><div class="e">'+esc(EDS[b[2]])+'</div></div>';
 }
-// Capas: 1) API do Google Livros pelo ISBN  2) Open Library pelo ISBN  3) capa colorida
-const CKEY='festaLivroUSP_capas_v2';
+// Capas: 1) Amazon pelo ISBN-10  2) API do Google Livros  3) Open Library  4) capa colorida
+const CKEY='festaLivroUSP_capas_v3';
+try{localStorage.removeItem('festaLivroUSP_capas_v2');}catch(e){}
 let CC={}; try{CC=JSON.parse(localStorage.getItem(CKEY)||'{}')||{};}catch(e){}
 let ccDirty=0; function saveCC(){ if(++ccDirty%10===0){ try{localStorage.setItem(CKEY,JSON.stringify(CC));}catch(e){} } }
 window.addEventListener('pagehide',()=>{try{localStorage.setItem(CKEY,JSON.stringify(CC));}catch(e){}});
-const pending={}; const waiters={};
-const Q=[]; let active=0; const MAXC=4; let netFail=0, netOk=0, backoff=0;
-function pump(){
-  while(active<MAXC && Q.length){
-    const job=Q.shift(); active++;
-    job().finally(()=>{active--; setTimeout(pump, backoff);});
-  }
+const pending={};
+const Q=[]; let active=0; const MAXC=5; let netFail=0, netOk=0;
+const ST={found:0,none:0,amz:0,goo:0,ol:0,g429:0,gerr:0}; let gOff=false;
+function stat(){ const el=$('cstat'); if(!el) return;
+  let t='Capas: '+ST.found+' encontradas, '+ST.none+' sem capa';
+  if(ST.found) t+=' (Amazon '+ST.amz+' · Google '+ST.goo+' · OpenLibrary '+ST.ol+')';
+  if(ST.g429||ST.gerr) t+=' · Google recusou '+(ST.g429+ST.gerr)+'×';
+  el.textContent=t; }
+function pump(){ while(active<MAXC && Q.length){ const job=Q.shift(); active++; job().finally(()=>{active--; pump();}); } }
+function probeImg(url,minW){ return new Promise(res=>{ const im=new Image(); let done=false;
+  const fin=v=>{ if(!done){done=true; res(v);} };
+  im.onload=()=>{ netOk++; hideBlocked(); fin(im.naturalWidth>(minW||2)?url:null); };
+  im.onerror=()=>fin(null); setTimeout(()=>fin(null),12000); im.src=url; }); }
+function isbn10(i13){
+  if(!i13) return ''; if(i13.length===10) return i13;
+  if(i13.slice(0,3)!=='978') return '';
+  const c=i13.slice(3,12); let s=0; for(let k=0;k<9;k++) s+=(10-k)*(+c[k]);
+  const ck=(11-s%11)%11; return c+(ck===10?'X':String(ck));
 }
-function probeImg(url){ return new Promise(res=>{ const im=new Image(); im.onload=()=>res(im.naturalWidth>2?url:null); im.onerror=()=>res(null); im.src=url; }); }
 async function googleCover(isbn){
+  if(gOff) return undefined;
   const u='https://www.googleapis.com/books/v1/volumes?q=isbn:'+isbn+'&fields=items(volumeInfo/imageLinks)&maxResults=1';
-  for(let t=0;t<3;t++){
-    let r;
-    try{ r=await fetch(u); }catch(e){ netFail++; checkBlocked(); return undefined; }
-    netOk++; hideBlocked();
-    if(r.status===429){ backoff=Math.min(4000,(backoff||300)*2); await new Promise(z=>setTimeout(z,backoff)); continue; }
-    backoff=Math.max(0,backoff-100);
-    if(!r.ok) return undefined;
-    const j=await r.json().catch(()=>null);
-    const il=j&&j.items&&j.items[0]&&j.items[0].volumeInfo&&j.items[0].volumeInfo.imageLinks;
-    if(!il) return null;
-    let url=il.thumbnail||il.smallThumbnail; if(!url) return null;
-    return url.replace(/^http:/,'https:').replace('&edge=curl','');
-  }
-  return undefined;
+  let r;
+  try{ r=await fetch(u); }catch(e){ netFail++; ST.gerr++; checkBlocked(); return undefined; }
+  netOk++; hideBlocked();
+  if(r.status===429||r.status===403){ ST.g429++; if(ST.g429>=6) gOff=true; return undefined; }
+  if(!r.ok){ ST.gerr++; return undefined; }
+  const j=await r.json().catch(()=>null);
+  const il=j&&j.items&&j.items[0]&&j.items[0].volumeInfo&&j.items[0].volumeInfo.imageLinks;
+  if(!il) return null;
+  let url=il.thumbnail||il.smallThumbnail; if(!url) return null;
+  return url.replace(/^http:/,'https:').replace('&edge=curl','');
 }
 function resolveCover(isbn){
   if(isbn in CC) return Promise.resolve(CC[isbn]);
   if(pending[isbn]) return pending[isbn];
   pending[isbn]=new Promise(done=>{
     Q.push(async()=>{
-      let url=await googleCover(isbn);
-      const gTemp = url===undefined; // falha temporária: não grava no cache
-      if(!url){ url=await probeImg('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg?default=false'); if(url) netOk++, hideBlocked(); }
-      if(url || !gTemp){ CC[isbn]=url||0; saveCC(); }
+      let url=null, temp=false, src='';
+      const i10=isbn10(isbn);
+      if(i10){ url=await probeImg('https://images-na.ssl-images-amazon.com/images/P/'+i10+'.01.LZZZZZZZ.jpg',20); if(url) src='amz'; }
+      if(!url){ const g=await googleCover(isbn); if(g===undefined) temp=true; else if(g){ url=await probeImg(g); if(url) src='goo'; } }
+      if(!url){ url=await probeImg('https://covers.openlibrary.org/b/isbn/'+isbn+'-M.jpg?default=false'); if(url) src='ol'; }
+      if(url){ ST.found++; ST[src]++; } else ST.none++;
+      stat();
+      if(url || !temp){ CC[isbn]=url||0; saveCC(); }
       delete pending[isbn]; done(url||0);
     });
     pump();
